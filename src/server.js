@@ -159,18 +159,14 @@ async function waitForGatewayReady(opts = {}) {
   while (Date.now() - start < timeoutMs) {
     if (gatewayLifecycle.unavailable || !gatewayLifecycle.child) return false;
     try {
-      // Try the default Control UI base path, then fall back to root.
-      const paths = ["/openclaw", "/"];
-      for (const p of paths) {
-        try {
-          const res = await fetch(`${GATEWAY_TARGET}${p}`, {
-            method: "GET", signal: AbortSignal.timeout(2_000),
-          });
-          // Any HTTP response means the port is open.
-          if (res) return true;
-        } catch {
-          // try next
-        }
+      // The UI can answer before plugins/channels finish starting. Use the
+      // same readiness signal as Railway before declaring a restart complete.
+      const res = await fetch(`${GATEWAY_TARGET}/startupz`, {
+        method: "GET", signal: AbortSignal.timeout(2_000),
+      });
+      if (res.ok && /application\/json/i.test(res.headers.get("content-type") || "")) {
+        await res.json();
+        return true;
       }
     } catch {
       // not ready
@@ -243,6 +239,10 @@ async function runDoctorBestEffort() {
 async function ensureGatewayRunning() {
   gatewayLifecycle.assertCanStart();
   if (!isConfigured()) return { ok: false, reason: "not configured" };
+  if (gatewayStarting) {
+    await gatewayStarting;
+    return { ok: true };
+  }
   if (gatewayLifecycle.child) return { ok: true };
   if (!gatewayStarting) {
     gatewayStarting = (async () => {
