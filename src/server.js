@@ -321,7 +321,7 @@ const weixinLogin = createWeixinLoginManager({
         OPENCLAW_STATE_DIR: STATE_DIR,
         OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
         OPENCLAW_NO_RESPAWN: "1",
-        OPENCLAW_LOG_LEVEL: "WARN",
+        OPENCLAW_LOG_LEVEL: "warn",
       },
     }),
   signalChild: (child, signal) => {
