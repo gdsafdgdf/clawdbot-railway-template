@@ -1,0 +1,6 @@
+# Disposable integration fixture only; no volume or public domain.
+[build]
+builder = "dockerfile"
+
+[deploy]
+restartPolicyType = "never"

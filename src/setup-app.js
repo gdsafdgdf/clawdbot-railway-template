@@ -26,6 +26,134 @@
   var importRunEl = document.getElementById('importRun');
   var importOutEl = document.getElementById('importOut');
 
+  // Short-lived Weixin login material stays in this page's memory and DOM only.
+  var wxStart = document.getElementById('weixinStart');
+  var wxCancel = document.getElementById('weixinCancel');
+  var wxMessage = document.getElementById('weixinMessage');
+  var wxQr = document.getElementById('weixinQr');
+  var wxLink = document.getElementById('weixinLink');
+  var wxPinForm = document.getElementById('weixinPinForm');
+  var wxPin = document.getElementById('weixinPin');
+  var wxVerify = document.getElementById('weixinVerify');
+  var wxState = null;
+  var wxTimer = null;
+  var wxMutationBusy = false;
+  var wxRequestSeq = 0;
+  var wxAppliedSeq = 0;
+
+  function clearWeixinPresentation() {
+    wxQr.textContent = '';
+    wxQr.hidden = true;
+    wxLink.removeAttribute('href');
+    wxLink.hidden = true;
+    wxPin.value = '';
+    wxPinForm.hidden = true;
+  }
+
+  function renderWeixin(state) {
+    wxState = state;
+    wxMessage.textContent = state.message || '尚未开始微信连接。';
+    wxStart.disabled = Boolean(state.active || wxMutationBusy);
+    wxCancel.hidden = !state.active;
+    wxCancel.disabled = wxMutationBusy || state.phase === 'cancelling' || state.phase === 'restoring';
+    wxVerify.disabled = wxMutationBusy;
+    if (!state.active || document.hidden) {
+      clearWeixinPresentation();
+      return;
+    }
+    wxQr.textContent = state.qrText || '';
+    wxQr.hidden = !state.qrText;
+    // Validate again at the DOM boundary; never accept executable URLs.
+    var safeUrl = null;
+    try {
+      var parsed = new URL(state.loginUrl || '');
+      if (parsed.protocol === 'https:' && !parsed.username && !parsed.password && !parsed.port &&
+          (parsed.hostname === 'qq.com' || parsed.hostname.slice(-7) === '.qq.com')) safeUrl = parsed.href;
+    } catch (_e) {}
+    if (safeUrl) wxLink.href = safeUrl;
+    else wxLink.removeAttribute('href');
+    wxLink.hidden = !safeUrl;
+    wxPinForm.hidden = !state.needsPin;
+    if (!state.needsPin) wxPin.value = '';
+  }
+
+  function weixinRequest(action, body) {
+    var sequence = ++wxRequestSeq;
+    return fetch('/setup/api/weixin/' + action, {
+      method: 'POST', credentials: 'same-origin', cache: 'no-store',
+      headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {})
+    }).then(function (response) {
+      return response.json().then(function (state) {
+        if (!response.ok) throw new Error(state.error || '微信连接暂时不可用。');
+        if (sequence >= wxAppliedSeq) {
+          wxAppliedSeq = sequence;
+          var wasActive = wxState && wxState.active;
+          renderWeixin(state);
+          if (wasActive && !state.active) refreshStatus();
+        }
+        return state;
+      });
+    });
+  }
+
+  function pollWeixin() {
+    clearTimeout(wxTimer);
+    return weixinRequest('status', {}).catch(function () {
+      clearWeixinPresentation();
+      wxMessage.textContent = '连接状态暂时无法读取，正在重试。';
+    }).then(function (state) {
+      if (!state || !wxState || wxState.active) wxTimer = setTimeout(pollWeixin, 1500);
+      return state;
+    });
+  }
+
+  function mutateWeixin(action, body) {
+    if (wxMutationBusy) return;
+    wxMutationBusy = true;
+    wxStart.disabled = true;
+    wxVerify.disabled = true;
+    wxCancel.disabled = true;
+    if (action === 'cancel') clearWeixinPresentation();
+    return weixinRequest(action, body).catch(function (error) {
+      // Endpoint errors are fixed public messages; no subprocess output is used.
+      wxMessage.textContent = error.message || '微信连接暂时不可用，请重试。';
+    }).then(function () {
+      wxMutationBusy = false;
+      wxStart.disabled = Boolean(wxState && wxState.active);
+      wxVerify.disabled = false;
+      wxCancel.disabled = Boolean(wxState && (wxState.phase === 'cancelling' || wxState.phase === 'restoring'));
+      clearTimeout(wxTimer);
+      // A lost mutation response does not mean the server did nothing. Always
+      // reconcile once, including when the last known state was idle.
+      wxTimer = setTimeout(pollWeixin, 500);
+    });
+  }
+
+  wxStart.onclick = function () { mutateWeixin('start', {}); };
+  wxCancel.onclick = function () {
+    if (wxState && wxState.id) mutateWeixin('cancel', { id: wxState.id });
+  };
+  wxPinForm.onsubmit = function (event) {
+    event.preventDefault();
+    var pin = wxPin.value;
+    wxPin.value = '';
+    if (!/^\d{4,12}$/.test(pin)) {
+      wxMessage.textContent = '请输入手机微信显示的 4 至 12 位数字。';
+      return;
+    }
+    if (wxState && wxState.id) mutateWeixin('verify', { id: wxState.id, pin: pin });
+    pin = '';
+  };
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) clearWeixinPresentation();
+    else pollWeixin();
+  });
+  window.addEventListener('pagehide', function () {
+    clearTimeout(wxTimer);
+    clearWeixinPresentation();
+    wxState = null;
+  });
+
   function setStatus(s) {
     statusEl.textContent = s;
   }
@@ -363,9 +491,14 @@
       .catch(function (e) { logEl.textContent += 'Error: ' + String(e) + '\n'; });
   };
 
-  // Populate provider/auth selects ASAP (fast endpoint, no subprocesses)
-  loadAuthGroupsFast();
-
-  // Load the rest of status (version/help) in parallel
-  refreshStatus();
+  // Reloading during QR login must not spawn competing setup CLI processes.
+  pollWeixin().then(function (state) {
+    if (state && state.active) {
+      setStatus('正在连接微信，完成或取消后助手会自动恢复。');
+      return;
+    }
+    loadAuthGroupsFast();
+    refreshStatus();
+  });
 })();
+

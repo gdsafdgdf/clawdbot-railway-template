@@ -8,6 +8,8 @@ import express from "express";
 import httpProxy from "http-proxy";
 import * as tar from "tar";
 import { createGatewayLifecycle } from "./gateway-lifecycle.js";
+import { createWeixinLoginManager } from "./weixin-login.mjs";
+import { validateWeixinRequest, validateWeixinBody } from "./weixin-login-http.mjs";
 
 // Migrate deprecated CLAWDBOT_* env vars → OPENCLAW_* so existing Railway deployments
 // keep working. Users should update their Railway Variables to use the new names.
@@ -137,6 +139,9 @@ function isConfigured() {
 
 const gatewayLifecycle = createGatewayLifecycle();
 let gatewayStarting = null;
+let wrapperBooting = true;
+let setupOperations = 0;
+let setupCommandCount = 0;
 
 // Debug breadcrumbs for common Railway failures (502 / "Application failed to respond").
 let lastGatewayError = null;
@@ -301,9 +306,94 @@ function requireSetupAuth(req, res, next) {
   return next();
 }
 
+const weixinLogin = createWeixinLoginManager({
+  stateDir: STATE_DIR,
+  withGatewayStopped,
+  ensureGatewayRunning,
+  spawnLogin: () => childProcess.spawn(OPENCLAW_NODE,
+    clawArgs(["channels", "login", "--channel", "openclaw-weixin"]), {
+      // The child can spawn its own workers. Cancellation owns their process
+      // group, and all output stays in the login manager's bounded memory.
+      detached: process.platform !== "win32",
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        OPENCLAW_STATE_DIR: STATE_DIR,
+        OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
+        OPENCLAW_NO_RESPAWN: "1",
+        OPENCLAW_LOG_LEVEL: "WARN",
+      },
+    }),
+  signalChild: (child, signal) => {
+    if (process.platform !== "win32" && child.pid) process.kill(-child.pid, signal);
+    else child.kill(signal);
+  },
+  isProcessGroupAlive: (child) => {
+    if (process.platform === "win32" || !Number.isSafeInteger(child.pid) || child.pid <= 0) return false;
+    try {
+      process.kill(-child.pid, 0);
+      return true;
+    } catch (error) {
+      if (error.code === "ESRCH") return false;
+      // A permission or probe error cannot prove that descendants have exited.
+      throw error;
+    }
+  },
+});
+
 const app = express();
 app.disable("x-powered-by");
+
+// Keep login bodies out of Express's general parser/error logger. A malformed
+// PIN request receives a fixed error, never a reflected body or stack trace.
+const weixinRoutes = express.Router();
+weixinRoutes.use(requireSetupAuth, (req, res, next) => {
+  res.set({ "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" });
+  const problem = validateWeixinRequest({
+    method: req.method, headers: req.headers, encrypted: Boolean(req.socket.encrypted),
+  });
+  if (problem) return res.status(problem.status).json({ error: problem.error });
+  return next();
+}, express.json({ limit: "2kb", strict: true }));
+weixinRoutes.use((req, res) => {
+  const action = req.path.slice(1);
+  const problem = validateWeixinBody(action, req.body);
+  if (problem) return res.status(problem.status).json({ error: problem.error });
+  try {
+    if (action === "start") {
+      if (!isConfigured()) return res.status(409).json({ error: "请先完成助手设置。" });
+      if (wrapperBooting || setupOperations || setupCommandCount || gatewayStarting || gatewayLifecycle.unavailable) {
+        return res.status(409).json({ error: "助手正在启动或处理设置，请稍后再连接微信。" });
+      }
+      return res.json(weixinLogin.start());
+    }
+    if (action === "verify") return res.json(weixinLogin.verify(req.body.id, req.body.pin));
+    if (action === "cancel") return res.json(weixinLogin.cancel(req.body.id));
+    return res.json(weixinLogin.status());
+  } catch (error) {
+    // Only the manager's intentional public messages may leave this endpoint.
+    const status = [400, 404, 409].includes(error?.statusCode) ? error.statusCode : 500;
+    return res.status(status).json({ error: status === 500 ? "微信连接暂时不可用。" : error.message });
+  }
+});
+weixinRoutes.use((_error, _req, res, _next) => {
+  res.status(400).json({ error: "请求格式不正确或内容过长。" });
+});
+app.use("/setup/api/weixin", weixinRoutes);
 app.use(express.json({ limit: "1mb" }));
+
+// Keep existing setup operations and their CLI children out of the low-memory
+// QR login window. Await the handler itself, even if the browser disconnects.
+function registerSetup(method, route, handler) {
+  app[method](route, requireSetupAuth, async (req, res, next) => {
+    if (weixinLogin.status().active) {
+      return res.status(409).json({ error: "正在连接微信，请完成或取消后再修改设置。" });
+    }
+    setupOperations += 1;
+    try { return await handler(req, res, next); }
+    finally { setupOperations -= 1; }
+  });
+}
 
 // Minimal health endpoint for Railway.
 app.get("/setup/healthz", (_req, res) => res.json({ ok: true }));
@@ -397,6 +487,9 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
     button { padding: 0.8rem 1.2rem; border-radius: 10px; border: 0; background: #111; color: #fff; font-weight: 700; cursor: pointer; }
     code { background: #f6f6f6; padding: 0.1rem 0.3rem; border-radius: 6px; }
     .muted { color: #555; }
+    #weixinQr { display: block; max-width: 100%; overflow-x: auto; background: #fff; color: #000; padding: 1rem; font: 10px/1 monospace; letter-spacing: 0; white-space: pre; }
+    #weixinQr[hidden], #weixinPinForm[hidden], #weixinLink[hidden], #weixinCancel[hidden] { display: none; }
+    button:disabled { opacity: .5; cursor: wait; }
   </style>
 </head>
 <body>
@@ -419,6 +512,21 @@ app.get("/setup", requireSetupAuth, (_req, res) => {
       <button id="importRun" style="background:#7c2d12; margin-top:0.5rem">Import</button>
       <pre id="importOut" style="white-space:pre-wrap"></pre>
     </div>
+  </div>
+
+  <div class="card" id="weixinPanel">
+    <h2>连接个人微信</h2>
+    <p class="muted">点击后用手机微信扫码。连接期间助手会暂时离线，完成或取消后自动恢复；最多等待 8 分钟。</p>
+    <button id="weixinStart" disabled>连接个人微信</button>
+    <button id="weixinCancel" hidden style="background:#555">取消连接</button>
+    <p id="weixinMessage" role="status" aria-live="polite">正在检查连接状态…</p>
+    <pre id="weixinQr" hidden aria-label="微信连接二维码"></pre>
+    <a id="weixinLink" hidden target="_blank" rel="noreferrer noopener">打开腾讯备用扫码页面</a>
+    <form id="weixinPinForm" hidden autocomplete="off">
+      <label for="weixinPin">手机微信显示的数字验证码</label>
+      <input id="weixinPin" type="password" inputmode="numeric" pattern="[0-9]{4,12}" minlength="4" maxlength="12" autocomplete="off" />
+      <button id="weixinVerify" type="submit" style="margin-top:.5rem">确认验证码</button>
+    </form>
   </div>
 
   <div class="card">
@@ -599,7 +707,7 @@ const AUTH_GROUPS = [
   ]}
 ];
 
-app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
+registerSetup("get", "/setup/api/status", async (_req, res) => {
   const version = await runCmd(OPENCLAW_NODE, clawArgs(["--version"]));
   const channelsHelp = await runCmd(OPENCLAW_NODE, clawArgs(["channels", "add", "--help"]));
 
@@ -612,7 +720,7 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
   });
 });
 
-app.get("/setup/api/auth-groups", requireSetupAuth, (_req, res) => {
+registerSetup("get", "/setup/api/auth-groups", (_req, res) => {
   res.json({ ok: true, authGroups: AUTH_GROUPS });
 });
 
@@ -694,6 +802,8 @@ function runCmd(cmd, args, opts = {}) {
         OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
       },
     });
+    setupCommandCount += 1;
+    proc.once("close", () => { setupCommandCount -= 1; });
 
     let out = "";
     proc.stdout?.on("data", (d) => (out += d.toString("utf8")));
@@ -724,7 +834,7 @@ function runCmd(cmd, args, opts = {}) {
   });
 }
 
-app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
+registerSetup("post", "/setup/api/run", async (req, res) => {
   try {
     const respondJson = (status, body) => {
       if (res.writableEnded || res.headersSent) return;
@@ -907,7 +1017,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
   }
 });
 
-app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
+registerSetup("get", "/setup/api/debug", async (_req, res) => {
   const v = await runCmd(OPENCLAW_NODE, clawArgs(["--version"]));
   const help = await runCmd(OPENCLAW_NODE, clawArgs(["channels", "add", "--help"]));
 
@@ -1010,7 +1120,7 @@ const ALLOWED_CONSOLE_COMMANDS = new Set([
   "openclaw.plugins.enable",
 ]);
 
-app.post("/setup/api/console/run", requireSetupAuth, async (req, res) => {
+registerSetup("post", "/setup/api/console/run", async (req, res) => {
   const payload = req.body || {};
   const cmd = String(payload.cmd || "").trim();
   const arg = String(payload.arg || "").trim();
@@ -1096,7 +1206,7 @@ app.post("/setup/api/console/run", requireSetupAuth, async (req, res) => {
   }
 });
 
-app.get("/setup/api/config/raw", requireSetupAuth, async (_req, res) => {
+registerSetup("get", "/setup/api/config/raw", async (_req, res) => {
   try {
     const p = configPath();
     const exists = fs.existsSync(p);
@@ -1107,7 +1217,7 @@ app.get("/setup/api/config/raw", requireSetupAuth, async (_req, res) => {
   }
 });
 
-app.post("/setup/api/config/raw", requireSetupAuth, async (req, res) => {
+registerSetup("post", "/setup/api/config/raw", async (req, res) => {
   try {
     const content = String((req.body && req.body.content) || "");
     if (content.length > 500_000) {
@@ -1136,7 +1246,7 @@ app.post("/setup/api/config/raw", requireSetupAuth, async (req, res) => {
   }
 });
 
-app.post("/setup/api/pairing/approve", requireSetupAuth, async (req, res) => {
+registerSetup("post", "/setup/api/pairing/approve", async (req, res) => {
   const { channel, code } = req.body || {};
   if (!channel || !code) {
     return res.status(400).json({ ok: false, error: "Missing channel or code" });
@@ -1146,14 +1256,14 @@ app.post("/setup/api/pairing/approve", requireSetupAuth, async (req, res) => {
 });
 
 // Device pairing helper (list + approve) to avoid needing SSH.
-app.get("/setup/api/devices/pending", requireSetupAuth, async (_req, res) => {
+registerSetup("get", "/setup/api/devices/pending", async (_req, res) => {
   const r = await runCmd(OPENCLAW_NODE, clawArgs(["devices", "list"]));
   const output = redactSecrets(r.output);
   const requestIds = extractDeviceRequestIds(output);
   return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, requestIds, output });
 });
 
-app.post("/setup/api/devices/approve", requireSetupAuth, async (req, res) => {
+registerSetup("post", "/setup/api/devices/approve", async (req, res) => {
   const requestId = String((req.body && req.body.requestId) || "").trim();
   if (!requestId) return res.status(400).json({ ok: false, error: "Missing device request ID" });
   if (!/^[A-Za-z0-9_-]+$/.test(requestId)) return res.status(400).json({ ok: false, error: "Invalid device request ID" });
@@ -1161,7 +1271,7 @@ app.post("/setup/api/devices/approve", requireSetupAuth, async (req, res) => {
   return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: redactSecrets(r.output) });
 });
 
-app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
+registerSetup("post", "/setup/api/reset", async (_req, res) => {
   // Reset: stop gateway (frees memory) + delete config file(s) so /setup can rerun.
   // Keep credentials/sessions/workspace by default.
   try {
@@ -1179,7 +1289,7 @@ app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
   }
 });
 
-app.get("/setup/export", requireSetupAuth, async (_req, res) => {
+registerSetup("get", "/setup/export", async (_req, res) => {
   fs.mkdirSync(STATE_DIR, { recursive: true });
   fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
 
@@ -1266,7 +1376,7 @@ async function readBodyBuffer(req, maxBytes) {
 
 // Import a backup created by /setup/export.
 // This is intentionally limited to restoring into /data to avoid overwriting arbitrary host paths.
-app.post("/setup/import", requireSetupAuth, async (req, res) => {
+registerSetup("post", "/setup/import", async (req, res) => {
   try {
     const dataRoot = "/data";
     if (!isUnderDir(STATE_DIR, dataRoot) || !isUnderDir(WORKSPACE_DIR, dataRoot)) {
@@ -1462,6 +1572,7 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
       console.error(`[wrapper] gateway failed to start at boot: ${String(err)}`);
     }
   }
+  wrapperBooting = false;
 });
 
 server.on("upgrade", async (req, socket, head) => {
@@ -1490,8 +1601,9 @@ process.on("SIGTERM", () => {
   // Stop accepting work immediately, but retain custody of the child while it
   // drains. If it times out, report failure and leave the reference intact.
   const stopped = gatewayLifecycle.shutdown();
+  const loginStopped = weixinLogin.shutdown();
   const closed = new Promise((resolve) => server.close(resolve));
-  void Promise.all([stopped, closed]).catch((error) => {
+  void Promise.all([stopped, loginStopped, closed]).catch((error) => {
     console.error(`[wrapper] shutdown incomplete: ${String(error)}`);
     process.exitCode = 1;
   });

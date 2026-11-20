@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { bootstrapWeixin } from "./weixin-bootstrap.mjs";
 
 for (const suffix of ["PUBLIC_PORT", "STATE_DIR", "WORKSPACE_DIR", "GATEWAY_TOKEN", "CONFIG_PATH"]) {
   const legacy = `CLAWDBOT_${suffix}`;
@@ -46,6 +47,15 @@ if (fs.existsSync(config)) {
   if (failed || interrupted || outcome.signal || outcome.code !== 0) {
     console.error("[activation] migration did not finish successfully; wrapper has not been started");
     process.exit(outcome.code || (interrupted === "SIGINT" ? 130 : 1));
+  }
+  const weixin = await bootstrapWeixin({ env: process.env, stateDir, entry });
+  if (weixin.status !== "disabled") {
+    console.log(`[weixin-bootstrap] ${weixin.status}`);
+    if (weixin.diagnosticsPath) console.log(`[weixin-bootstrap] diagnostics: ${weixin.diagnosticsPath}`);
+  }
+  if (!weixin.continueStartup) {
+    console.error("[weixin-bootstrap] maintenance did not release state safely; gateway has not been started");
+    process.exit(1);
   }
 }
 

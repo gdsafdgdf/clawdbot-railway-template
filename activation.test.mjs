@@ -12,6 +12,7 @@ function run({ configured = true, fail = false, legacy = false } = {}) {
     mkdirSync(path.join(root, "state"));
     if (configured) writeFileSync(path.join(root, "state/openclaw.json"), "{}");
     copyFileSync(new URL("./src/railway-start.mjs", import.meta.url), path.join(root, "src/railway-start.mjs"));
+    copyFileSync(new URL("./src/weixin-bootstrap.mjs", import.meta.url), path.join(root, "src/weixin-bootstrap.mjs"));
     writeFileSync(path.join(root, "fake-openclaw.mjs"), `
       import assert from 'node:assert/strict';
       assert.deepEqual(process.argv.slice(2), ['doctor','--fix','--non-interactive']);
