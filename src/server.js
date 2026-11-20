@@ -7,6 +7,7 @@ import path from "node:path";
 import express from "express";
 import httpProxy from "http-proxy";
 import * as tar from "tar";
+import { createGatewayLifecycle } from "./gateway-lifecycle.js";
 
 // Migrate deprecated CLAWDBOT_* env vars → OPENCLAW_* so existing Railway deployments
 // keep working. Users should update their Railway Variables to use the new names.
@@ -134,7 +135,7 @@ function isConfigured() {
   }
 })();
 
-let gatewayProc = null;
+const gatewayLifecycle = createGatewayLifecycle();
 let gatewayStarting = null;
 
 // Debug breadcrumbs for common Railway failures (502 / "Application failed to respond").
@@ -151,12 +152,15 @@ async function waitForGatewayReady(opts = {}) {
   const timeoutMs = opts.timeoutMs ?? 20_000;
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
+    if (gatewayLifecycle.unavailable || !gatewayLifecycle.child) return false;
     try {
       // Try the default Control UI base path, then fall back to root.
       const paths = ["/openclaw", "/"];
       for (const p of paths) {
         try {
-          const res = await fetch(`${GATEWAY_TARGET}${p}`, { method: "GET" });
+          const res = await fetch(`${GATEWAY_TARGET}${p}`, {
+            method: "GET", signal: AbortSignal.timeout(2_000),
+          });
           // Any HTTP response means the port is open.
           if (res) return true;
         } catch {
@@ -172,7 +176,8 @@ async function waitForGatewayReady(opts = {}) {
 }
 
 async function startGateway() {
-  if (gatewayProc) return;
+  gatewayLifecycle.assertCanStart();
+  if (gatewayLifecycle.child) return;
   if (!isConfigured()) throw new Error("Gateway cannot start: not configured");
 
   fs.mkdirSync(STATE_DIR, { recursive: true });
@@ -191,27 +196,27 @@ async function startGateway() {
     OPENCLAW_GATEWAY_TOKEN,
   ];
 
-  gatewayProc = childProcess.spawn(OPENCLAW_NODE, clawArgs(args), {
+  const proc = childProcess.spawn(OPENCLAW_NODE, clawArgs(args), {
     stdio: "inherit",
     env: {
       ...process.env,
       OPENCLAW_STATE_DIR: STATE_DIR,
       OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
+      OPENCLAW_NO_RESPAWN: "1",
     },
   });
+  gatewayLifecycle.track(proc);
 
-  gatewayProc.on("error", (err) => {
+  proc.on("error", (err) => {
     const msg = `[gateway] spawn error: ${String(err)}`;
     console.error(msg);
     lastGatewayError = msg;
-    gatewayProc = null;
   });
 
-  gatewayProc.on("exit", (code, signal) => {
+  proc.on("close", (code, signal) => {
     const msg = `[gateway] exited code=${code} signal=${signal}`;
     console.error(msg);
     lastGatewayExit = { code, signal, at: new Date().toISOString() };
-    gatewayProc = null;
   });
 }
 
@@ -231,14 +236,15 @@ async function runDoctorBestEffort() {
 }
 
 async function ensureGatewayRunning() {
+  gatewayLifecycle.assertCanStart();
   if (!isConfigured()) return { ok: false, reason: "not configured" };
-  if (gatewayProc) return { ok: true };
+  if (gatewayLifecycle.child) return { ok: true };
   if (!gatewayStarting) {
     gatewayStarting = (async () => {
       try {
         lastGatewayError = null;
         await startGateway();
-        const ready = await waitForGatewayReady({ timeoutMs: 20_000 });
+        const ready = await waitForGatewayReady({ timeoutMs: 90_000 });
         if (!ready) {
           throw new Error("Gateway did not become ready in time");
         }
@@ -246,7 +252,7 @@ async function ensureGatewayRunning() {
         const msg = `[gateway] start failure: ${String(err)}`;
         lastGatewayError = msg;
         // Collect extra diagnostics to help users file issues.
-        await runDoctorBestEffort();
+        if (!gatewayLifecycle.unavailable) await runDoctorBestEffort();
         throw err;
       }
     })().finally(() => {
@@ -258,17 +264,17 @@ async function ensureGatewayRunning() {
 }
 
 async function restartGateway() {
-  if (gatewayProc) {
-    try {
-      gatewayProc.kill("SIGTERM");
-    } catch {
-      // ignore
-    }
-    // Give it a moment to exit and release the port.
-    await sleep(750);
-    gatewayProc = null;
-  }
+  await withGatewayStopped(async () => {});
   return ensureGatewayRunning();
+}
+
+async function withGatewayStopped(action) {
+  return gatewayLifecycle.withStopped(async () => {
+    // A startup readiness poll must finish before state is changed or another
+    // gateway is started. Maintenance makes that poll cancel without Doctor.
+    if (gatewayStarting) await gatewayStarting.catch(() => {});
+    return action();
+  });
 }
 
 function requireSetupAuth(req, res, next) {
@@ -327,6 +333,21 @@ async function probeGateway() {
 
 // Public health endpoint (no auth) so Railway can probe without /setup.
 // Keep this free of secrets.
+app.get("/readyz", async (_req, res) => {
+  let ready = !isConfigured();
+  if (!ready) {
+    try {
+      const response = await fetch(`${GATEWAY_TARGET}/startupz`, {
+        signal: AbortSignal.timeout(2_000),
+      });
+      ready = response.ok;
+    } catch {
+      ready = false;
+    }
+  }
+  res.status(ready ? 200 : 503).json({ ready });
+});
+
 app.get("/healthz", async (_req, res) => {
   let gatewayReachable = false;
   if (isConfigured()) {
@@ -910,7 +931,7 @@ app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
       internalGatewayHost: INTERNAL_GATEWAY_HOST,
       internalGatewayPort: INTERNAL_GATEWAY_PORT,
       gatewayTarget: GATEWAY_TARGET,
-      gatewayRunning: Boolean(gatewayProc),
+      gatewayRunning: Boolean(gatewayLifecycle.child),
       gatewayTokenFromEnv: Boolean(process.env.OPENCLAW_GATEWAY_TOKEN?.trim()),
       gatewayTokenPersisted: fs.existsSync(path.join(STATE_DIR, "gateway.token")),
       lastGatewayError,
@@ -1004,11 +1025,7 @@ app.post("/setup/api/console/run", requireSetupAuth, async (req, res) => {
       return res.json({ ok: true, output: "Gateway restarted (wrapper-managed).\n" });
     }
     if (cmd === "gateway.stop") {
-      if (gatewayProc) {
-        try { gatewayProc.kill("SIGTERM"); } catch {}
-        await sleep(750);
-        gatewayProc = null;
-      }
+      await withGatewayStopped(async () => {});
       return res.json({ ok: true, output: "Gateway stopped (wrapper-managed).\n" });
     }
     if (cmd === "gateway.start") {
@@ -1148,21 +1165,13 @@ app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
   // Reset: stop gateway (frees memory) + delete config file(s) so /setup can rerun.
   // Keep credentials/sessions/workspace by default.
   try {
-    // Stop gateway to avoid running gateway + onboard concurrently on small Railway instances.
-    try {
-      if (gatewayProc) {
-        try { gatewayProc.kill("SIGTERM"); } catch {}
-        await sleep(750);
-        gatewayProc = null;
+    // Keep request-driven starts blocked until the child closes and reset ends.
+    await withGatewayStopped(async () => {
+      const candidates = typeof resolveConfigCandidates === "function" ? resolveConfigCandidates() : [configPath()];
+      for (const p of candidates) {
+        try { fs.rmSync(p, { force: true }); } catch {}
       }
-    } catch {
-      // ignore
-    }
-
-    const candidates = typeof resolveConfigCandidates === "function" ? resolveConfigCandidates() : [configPath()];
-    for (const p of candidates) {
-      try { fs.rmSync(p, { force: true }); } catch {}
-    }
+    });
 
     res.type("text/plain").send("OK - stopped gateway and deleted config file(s). You can rerun setup now.");
   } catch (err) {
@@ -1267,13 +1276,6 @@ app.post("/setup/import", requireSetupAuth, async (req, res) => {
         .send("Import is only supported when OPENCLAW_STATE_DIR and OPENCLAW_WORKSPACE_DIR are under /data (Railway volume).\n");
     }
 
-    // Stop gateway before restore so we don't overwrite live files.
-    if (gatewayProc) {
-      try { gatewayProc.kill("SIGTERM"); } catch {}
-      await sleep(750);
-      gatewayProc = null;
-    }
-
     const buf = await readBodyBuffer(req, 250 * 1024 * 1024); // 250MB max
     if (!buf.length) return res.status(400).type("text/plain").send("Empty body\n");
 
@@ -1283,23 +1285,26 @@ app.post("/setup/import", requireSetupAuth, async (req, res) => {
     const tmpPath = path.join(os.tmpdir(), `openclaw-import-${Date.now()}.tar.gz`);
     fs.writeFileSync(tmpPath, buf);
 
-    await tar.x({
-      file: tmpPath,
-      cwd: dataRoot,
-      gzip: true,
-      strict: true,
-      onwarn: () => {},
-      filter: (p) => {
-        // Allow only paths that look safe.
-        return looksSafeTarPath(p);
-      },
-    });
-
-    try { fs.rmSync(tmpPath, { force: true }); } catch {}
+    try {
+      // Keep all request-driven starts blocked throughout restore, not just
+      // while SIGTERM is pending. A timed-out stop leaves live files untouched.
+      await withGatewayStopped(async () => {
+        await tar.x({
+          file: tmpPath,
+          cwd: dataRoot,
+          gzip: true,
+          strict: true,
+          onwarn: () => {},
+          filter: (p) => looksSafeTarPath(p),
+        });
+      });
+    } finally {
+      try { fs.rmSync(tmpPath, { force: true }); } catch {}
+    }
 
     // Restart gateway after restore.
     if (isConfigured()) {
-      await restartGateway();
+      await ensureGatewayRunning();
     }
 
     res.type("text/plain").send("OK - imported backup into /data and restarted gateway.\n");
@@ -1478,20 +1483,17 @@ server.on("upgrade", async (req, socket, head) => {
   proxy.ws(req, socket, head, { target: GATEWAY_TARGET });
 });
 
+let wrapperStopping = false;
 process.on("SIGTERM", () => {
-  // Best-effort shutdown
-  try {
-    if (gatewayProc) gatewayProc.kill("SIGTERM");
-  } catch {
-    // ignore
-  }
-
-  // Stop accepting new connections; allow in-flight requests to complete briefly.
-  try {
-    server.close(() => process.exit(0));
-  } catch {
-    process.exit(0);
-  }
-
-  setTimeout(() => process.exit(0), 5_000).unref?.();
+  if (wrapperStopping) return;
+  wrapperStopping = true;
+  // Stop accepting work immediately, but retain custody of the child while it
+  // drains. If it times out, report failure and leave the reference intact.
+  const stopped = gatewayLifecycle.shutdown();
+  const closed = new Promise((resolve) => server.close(resolve));
+  void Promise.all([stopped, closed]).catch((error) => {
+    console.error(`[wrapper] shutdown incomplete: ${String(error)}`);
+    process.exitCode = 1;
+  });
 });
+
