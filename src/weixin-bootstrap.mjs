@@ -40,7 +40,9 @@ export function inspectWeixinInventory(stdout) {
   if (matches.length === 0) return { state: "missing" };
   if (matches.length !== 1) return { state: "conflict", reason: "duplicate-plugin-id" };
   const plugin = matches[0];
-  if (plugin.packageName !== WEIXIN_PACKAGE || plugin.version !== WEIXIN_VERSION ||
+  // The v2026.11.6 cold listing omits packageName/packageVersion. Defer
+  // authoritative package identity to inspect; still reject explicit mismatches.
+  if ((plugin.packageName !== undefined && plugin.packageName !== WEIXIN_PACKAGE) || plugin.version !== WEIXIN_VERSION ||
       (plugin.packageVersion !== undefined && plugin.packageVersion !== WEIXIN_VERSION)) {
     return { state: "conflict", reason: "package-or-version-mismatch" };
   }
@@ -60,7 +62,7 @@ export function inspectWeixinRuntime(stdout, { requireExplicitEnablement = false
   const install = report?.install;
   if (inventory.state !== "present" || inventory.enabled !== true || inventory.status !== "loaded" ||
       report.plugin.imported !== true) throw new Error("Plugin runtime loading was not verified");
-  if (install?.source !== "npm" || install.spec !== PINNED_SPEC ||
+  if (report.plugin.packageName !== WEIXIN_PACKAGE || install?.source !== "npm" || install.spec !== PINNED_SPEC ||
       install.resolvedSpec !== PINNED_SPEC || install.version !== WEIXIN_VERSION) {
     throw new Error("Plugin npm installation provenance was not verified");
   }
@@ -320,9 +322,10 @@ async function runBootstrap({
     const after = await inventory();
     if (!installSucceeded && after.state === "missing") return result("install-failed");
     if (after.state !== "present") return result("verification-failed", { reason: after.reason ?? after.state });
-    if (!after.enabled) return result("installed-disabled");
-    // The catalog default enables runtime loading, but channel login still
-    // requires an explicit enable. Preserve an existing authored disable above.
+    // This opt-in explicitly requests installation and enablement. The retained
+    // allowlist may leave a newly installed plugin disabled after --no-enable;
+    // the official enable command adds this requested plugin without replacing
+    // that allowlist. Existing disabled installations returned above unchanged.
     const enabled = await invoke(["plugins", "enable", PLUGIN_ID]);
     if (!commandSucceeded(enabled)) return await disableNewInstall("explicit-enable-failed");
     let plugin;

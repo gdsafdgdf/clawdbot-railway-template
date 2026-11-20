@@ -13,6 +13,9 @@ const enable = ["plugins", "enable", "openclaw-weixin"];
 const plugin = (overrides = {}) => ({ id: "openclaw-weixin", packageName: "@tencent-weixin/openclaw-weixin",
   version: "2.4.10", packageVersion: "2.4.10", enabled: true, explicitlyEnabled: true, status: "loaded", imported: true,
   dependencyStatus: { requiredInstalled: true }, ...overrides });
+// Actual v2026.11.6 plugins-list projection omits package identity and activation details.
+const listPlugin = (overrides = {}) => ({ id: "openclaw-weixin", version: "2.4.10",
+  enabled: true, status: "loaded", dependencyStatus: { requiredInstalled: true }, ...overrides });
 const inventory = plugins => JSON.stringify({ plugins, diagnostics: [] });
 const runtime = (overrides = {}) => JSON.stringify({ plugin: plugin(), install: {
   source: "npm", spec: "@tencent-weixin/openclaw-weixin@2.4.10",
@@ -56,7 +59,7 @@ test("fresh install uses fixed official flags, waits for real runtime proof, and
     assert.ok(fs.existsSync(f.marker("attempt.json")), "attempt must precede installer");
     assert.equal(fs.existsSync(f.marker("verified.json")), false);
     return ok();
-  }], [list, ok(inventory([plugin({ explicitlyEnabled: false })]))], [enable, ok()], [inspect, ok(runtime())]]);
+  }], [list, ok(inventory([listPlugin({ explicitlyEnabled: false })]))], [enable, ok()], [inspect, ok(runtime())]]);
   assert.equal(result.status, "installed-and-verified");
   assert.equal(result.continueStartup, true);
   const proof = JSON.parse(fs.readFileSync(f.marker("verified.json"), "utf8"));
@@ -69,16 +72,30 @@ test("fresh install uses fixed official flags, waits for real runtime proof, and
 
 test("existing exact install is inspected without installation or config mutation", async t => {
   const f = fixture(t);
-  const result = await f.run([[list, ok(inventory([plugin()]))], [inspect, ok(runtime())]]);
+  const result = await f.run([[list, ok(inventory([listPlugin()]))], [inspect, ok(runtime())]]);
   assert.equal(result.status, "verified-existing");
   assert.equal(fs.existsSync(f.marker("attempt.json")), false);
   assert.deepEqual(f.calls, [list, inspect]);
 });
 
+test("real minimal cold list defers package identity to authoritative inspection", async t => {
+  for (const packageName of [undefined, "different-package"]) {
+    const f = fixture(t);
+    const cold = listPlugin();
+    assert.equal(Object.hasOwn(cold, "packageName"), false);
+    assert.equal(Object.hasOwn(cold, "packageVersion"), false);
+    const result = await f.run([[list, ok(inventory([cold]))],
+      [inspect, ok(runtime({ plugin: plugin({ packageName }) }))]]);
+    assert.equal(result.status, "needs-review");
+    assert.deepEqual(f.calls, [list, inspect]);
+    assert.equal(fs.existsSync(f.marker("verified.json")), false);
+  }
+});
+
 test("an interrupted installation without explicit enablement is left for review", async t => {
   const f = fixture(t);
   const result = await f.run([
-    [list, ok(inventory([plugin({ explicitlyEnabled: false })]))],
+    [list, ok(inventory([listPlugin({ explicitlyEnabled: false })]))],
     [inspect, ok(runtime({ plugin: plugin({ explicitlyEnabled: false }) }))],
   ]);
   assert.equal(result.status, "needs-review");
@@ -119,7 +136,7 @@ test("failed install is not retried, but later manual repair can still verify", 
   const retry = await f.run([[list, ok(inventory([]))]]);
   assert.equal(retry.status, "already-attempted");
   assert.ok(fs.existsSync(failure.diagnosticsPath), "original diagnostics must survive restart");
-  const repaired = await f.run([[list, ok(inventory([plugin()]))], [inspect, ok(runtime())]]);
+  const repaired = await f.run([[list, ok(inventory([listPlugin()]))], [inspect, ok(runtime())]]);
   assert.equal(repaired.status, "verified-existing");
   assert.equal(f.calls.filter(args => args[1] === "install").length, 1);
 });
@@ -129,7 +146,7 @@ test("simultaneous bootstrap callers share one complete installation and verific
   let release;
   const pause = new Promise(resolve => { release = resolve; });
   const run = f.makeRunner([[list, async () => { await pause; return ok(inventory([])); }],
-    [install, ok()], [list, ok(inventory([plugin()]))], [enable, ok()], [inspect, ok(runtime())]]);
+    [install, ok()], [list, ok(inventory([listPlugin()]))], [enable, ok()], [inspect, ok(runtime())]]);
   const options = { stateDir: f.stateDir, env: f.env, run };
   const first = bootstrapWeixin(options);
   const second = bootstrapWeixin(options);
@@ -141,20 +158,21 @@ test("simultaneous bootstrap callers share one complete installation and verific
   assert.equal(f.calls.filter(args => args[1] === "install").length, 1);
 });
 
-test("fresh disabled installation preserves activation policy instead of enabling it", async t => {
+test("a fresh disabled install requests explicit enable through official policy checks", async t => {
   const f = fixture(t);
   const result = await f.run([[list, ok(inventory([]))], [install, ok()],
-    [list, ok(inventory([plugin({ enabled: false, status: "disabled" })]))]]);
-  assert.equal(result.status, "installed-disabled");
+    [list, ok(inventory([listPlugin({ enabled: false, status: "disabled" })]))],
+    [enable, ok()], [inspect, ok(runtime())]]);
+  assert.equal(result.status, "installed-and-verified");
   assert.equal(result.continueStartup, true);
-  assert.equal(fs.existsSync(f.marker("verified.json")), false);
+  assert.equal(fs.existsSync(f.marker("verified.json")), true);
 });
 
 test("failed explicit enable cleans up only the new install and does not attempt runtime loading", async t => {
   const f = fixture(t);
   const result = await f.run([[list, ok(inventory([]))], [install, ok()],
-    [list, ok(inventory([plugin({ explicitlyEnabled: false })]))], [enable, { ...ok(), code: 1 }],
-    [disable, ok()], [list, ok(inventory([plugin({ enabled: false, status: "disabled" })]))]]);
+    [list, ok(inventory([listPlugin({ explicitlyEnabled: false })]))], [enable, { ...ok(), code: 1 }],
+    [disable, ok()], [list, ok(inventory([listPlugin({ enabled: false, status: "disabled" })]))]]);
   assert.equal(result.status, "installed-disabled");
   assert.equal(result.continueStartup, true);
   assert.ok(!f.calls.some(args => args[1] === "inspect"));
@@ -169,8 +187,8 @@ test("runtime failure only disables this invocation's new install and verifies c
     { ...ok(), code: 1 }, { ...ok(runtime()), timedOut: true }]) {
     const f = fixture(t);
     const result = await f.run([[list, ok(inventory([]))], [install, ok()],
-      [list, ok(inventory([plugin()]))], [enable, ok()], [inspect, response], [disable, ok()],
-      [list, ok(inventory([plugin({ enabled: false, status: "disabled" })]))]]);
+      [list, ok(inventory([listPlugin()]))], [enable, ok()], [inspect, response], [disable, ok()],
+      [list, ok(inventory([listPlugin({ enabled: false, status: "disabled" })]))]]);
     assert.equal(result.status, "installed-disabled");
     assert.equal(result.continueStartup, true);
     assert.equal(fs.existsSync(f.marker("verified.json")), false);
@@ -179,7 +197,7 @@ test("runtime failure only disables this invocation's new install and verifies c
 
 test("existing install with invalid runtime provenance is left for review without disabling it", async t => {
   const f = fixture(t);
-  const result = await f.run([[list, ok(inventory([plugin()]))], [inspect, ok(runtime({ install: {} }))]]);
+  const result = await f.run([[list, ok(inventory([listPlugin()]))], [inspect, ok(runtime({ install: {} }))]]);
   assert.equal(result.status, "needs-review");
   assert.equal(result.continueStartup, true);
   assert.deepEqual(f.calls, [list, inspect]);
@@ -200,8 +218,8 @@ test("unreaped installer or interrupted boot cannot hand custody to Gateway", as
 test("failed installer that already committed is reconciled and safely disabled on runtime failure", async t => {
   const f = fixture(t);
   const result = await f.run([[list, ok(inventory([]))], [install, { ...ok(), code: 1 }],
-    [list, ok(inventory([plugin()]))], [enable, ok()], [inspect, { ...ok(), code: 1 }], [disable, ok()],
-    [list, ok(inventory([plugin({ enabled: false, status: "disabled" })]))]]);
+    [list, ok(inventory([listPlugin()]))], [enable, ok()], [inspect, { ...ok(), code: 1 }], [disable, ok()],
+    [list, ok(inventory([listPlugin({ enabled: false, status: "disabled" })]))]]);
   assert.equal(result.status, "installed-disabled");
   assert.equal(result.continueStartup, true);
   assert.equal(fs.existsSync(f.marker("verified.json")), false);
@@ -210,7 +228,7 @@ test("failed installer that already committed is reconciled and safely disabled 
 test("unverified disable cannot report a safe continuation for this boot", async t => {
   const f = fixture(t);
   const result = await f.run([[list, ok(inventory([]))], [install, ok()],
-    [list, ok(inventory([plugin()]))], [enable, ok()], [inspect, { ...ok(), code: 1 }], [disable, { ...ok(), code: 1 }]]);
+    [list, ok(inventory([listPlugin()]))], [enable, ok()], [inspect, { ...ok(), code: 1 }], [disable, { ...ok(), code: 1 }]]);
   assert.equal(result.status, "disable-unverified");
   assert.equal(result.continueStartup, false);
   assert.equal(fs.existsSync(f.marker("verified.json")), false);
@@ -227,8 +245,8 @@ test("diagnostic write failure after install cannot skip runtime verification or
     return originalOpen(file, ...args);
   });
   const result = await f.run([[list, ok(inventory([]))], [install, () => { full = true; return ok(); }],
-    [list, ok(inventory([plugin()]))], [enable, ok()], [inspect, { ...ok(), code: 1 }], [disable, ok()],
-    [list, ok(inventory([plugin({ enabled: false, status: "disabled" })]))]]);
+    [list, ok(inventory([listPlugin()]))], [enable, ok()], [inspect, { ...ok(), code: 1 }], [disable, ok()],
+    [list, ok(inventory([listPlugin({ enabled: false, status: "disabled" })]))]]);
   assert.equal(result.status, "installed-disabled");
   assert.equal(result.continueStartup, true);
   assert.match(result.diagnosticsWarning, /full diagnostics/);
@@ -242,7 +260,7 @@ test("failure to write a success marker does not disable a runtime that was veri
     return originalOpen(file, ...args);
   });
   const result = await f.run([[list, ok(inventory([]))], [install, ok()],
-    [list, ok(inventory([plugin()]))], [enable, ok()], [inspect, ok(runtime())]]);
+    [list, ok(inventory([listPlugin()]))], [enable, ok()], [inspect, ok(runtime())]]);
   assert.equal(result.status, "bootstrap-failed");
   assert.equal(result.continueStartup, true);
   assert.ok(!f.calls.some(args => args[1] === "disable"));
