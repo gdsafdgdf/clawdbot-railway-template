@@ -212,9 +212,26 @@ try {
   }
   assert.ok(ready, "Wrapper /readyz did not become ready within six minutes");
   assert.ok(sawActivation, "Retained-state activation was not observed");
-  const bootstrapStatus = tail.match(/\[weixin-bootstrap\] ([a-z-]+)\n/)?.[1];
-  console.log(`WEIXIN_WRAPPER_CHECK: bootstrap status ${bootstrapStatus || "missing"}`);
-  assert.equal(bootstrapStatus, "installed-and-verified", "Fresh bootstrap must verify runtime and explicit enablement");
+  const verifiedPath = path.join(state, "railway-bootstrap", "weixin-2.4.10", "verified.json");
+  if (!fs.existsSync(verifiedPath)) {
+    const diagnosticDir = path.dirname(verifiedPath);
+    for (const name of fs.existsSync(diagnosticDir) ? fs.readdirSync(diagnosticDir) : []) {
+      if (!/^diagnostics-[a-f0-9-]+\.json$/.test(name)) continue;
+      const d = JSON.parse(fs.readFileSync(path.join(diagnosticDir, name), "utf8"));
+      console.log("WEIXIN_WRAPPER_CHECK: bootstrap diagnostics " + JSON.stringify({
+        error: d.error,
+        commands: d.commands?.map(c => ({args:c.args, code:c.code, signal:c.signal,
+          custodyReleased:c.custodyReleased, timedOut:c.timedOut, stdoutTruncated:c.stdoutTruncated}))
+      }));
+    }
+  }
+  assert.equal(fs.existsSync(verifiedPath), true, "Fresh bootstrap must record verified runtime");
+  const verifiedPlugin = JSON.parse(fs.readFileSync(verifiedPath, "utf8"));
+  assert.equal(verifiedPlugin.version, "2.4.10");
+  assert.equal(verifiedPlugin.imported, true);
+  assert.equal(verifiedPlugin.explicitlyEnabled, true);
+  assert.equal(verifiedPlugin.source, "npm");
+  console.log("WEIXIN_WRAPPER_CHECK: pinned plugin runtime and explicit enablement verified");
   console.log("WEIXIN_WRAPPER_CHECK: legacy fixture activation and wrapper /readyz passed");
   await logFixtureTrustedProxies();
 
